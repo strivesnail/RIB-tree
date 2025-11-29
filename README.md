@@ -25,9 +25,6 @@ RIB-tree/
 ├── config_generator/      # Configuration generation tools
 │   ├── partition_optimize.cpp  # Generate segment configuration files
 │   └── segmentation.h     # Segmentation algorithms
-├── configs/               # Segment configuration files
-│   ├── segment_longitudes-100.csv
-│   └── segment_longitudes-200.csv
 └── Makefile              # Build configuration
 ```
 
