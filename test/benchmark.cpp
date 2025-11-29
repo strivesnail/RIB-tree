@@ -28,7 +28,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include "btreeolc.h"
+#include "src/btreeolc.h"
 
 using namespace std;
 using namespace ribtree;

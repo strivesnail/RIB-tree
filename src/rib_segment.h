@@ -39,7 +39,7 @@ namespace seg {
 }
 
 // Include segmentation.h for calculateSegments and toStructSegment
-// segmentation.h already includes lib_utils.h, so we don't need to include it separately
+// segmentation.h already includes rib_utils.h, so we don't need to include it separately
 #include "config_generator/segmentation.h"
 
 namespace ribtree {
@@ -932,7 +932,7 @@ public:
         std::vector<size_t> box_start_positions(static_cast<size_t>(end_logical_box - start_logical_box + 2), 0);
         size_t total_size = 0;
 
-        // 计算每个逻辑box的大小
+        // Calculate size of each logical box
         for (int logical_idx = start_logical_box; logical_idx <= end_logical_box; logical_idx++) {
             size_t logical_box_size = 0;
             uint8_t max_position = logical_box_write_positions[logical_idx].load(std::memory_order_acquire);
@@ -949,7 +949,7 @@ public:
 
         mergedEntries.resize(total_size);
 
-        // 提取数据
+        // Extract data from logical boxes
         for (int logical_idx = start_logical_box; logical_idx <= end_logical_box; logical_idx++) {
             size_t start_pos = box_start_positions[logical_idx - start_logical_box];
             size_t current_pos = start_pos;

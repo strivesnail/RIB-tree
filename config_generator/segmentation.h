@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-#include "../lib_utils.h"
+#include "../src/rib_utils.h"
 using namespace ribtree;
 
 // Define MAX_KEYS_IN_SEGMENT if not already defined

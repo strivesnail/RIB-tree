@@ -6,9 +6,7 @@
 
 #include "segmentation.h"
 
-// max val w/o overflow
-// Note: MAX_KEYS_IN_SEGMENT is defined in segmentation.h, we just need to set it
-// We'll set it via the optional parameter in main()
+// Note: MAX_KEYS_IN_SEGMENT is defined in segmentation.h
 
 using KeyType = int64_t; // vmware&cambridge uint32_t; longitudes-200M int64_T
 
@@ -85,7 +83,7 @@ int main(int argc, char* argv[]) {
     if (argc < 3) {
         std::cerr << "Usage: " << argv[0] << " <input_file> <output_file>" << std::endl;
         std::cerr << "E.g.: ./partition_optimize w106.csv ../configs/segments_w106.csv" << std::endl;
-        std::cerr << "      (建议将输出文件放在 ../configs/ 文件夹中)" << std::endl;
+        std::cerr << "      (Recommended: place output file in ../configs/ directory)" << std::endl;
         return -1;
     }
 
@@ -157,8 +155,7 @@ int main(int argc, char* argv[]) {
             end = final_segments[i].seg_upper;
         }
         
-        // Calculate keys_count: count keys in range [start, end)
-        // Use binary search to find the range efficiently
+        // Calculate keys_count using binary search
         auto start_it = std::lower_bound(data.begin(), data.end(), start);
         auto end_it = std::lower_bound(data.begin(), data.end(), end);
         size_t keys_count = end_it - start_it;
