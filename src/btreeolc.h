@@ -341,59 +341,11 @@ struct BTree {
        bool is_inner;
    };
 
-   // Promoted segments to root: data structures and lock
-   struct PromotedSegmentsLock {
-     std::atomic<uint64_t> typeVersionLockObsolete{0b100};
-     
-     uint64_t readLockOrRestart(bool &needRestart) {
-       uint64_t version = typeVersionLockObsolete.load();
-       if (((version & 0b10) == 0b10) || ((version & 1) == 1)) {
-         _mm_pause();
-         needRestart = true;
-       }
-       return version;
-     }
-     
-     void writeLockOrRestart(bool &needRestart) {
-       uint64_t version = readLockOrRestart(needRestart);
-       if (needRestart) return;
-       if (typeVersionLockObsolete.compare_exchange_strong(version, version + 0b10)) {
-         version = version + 0b10;
-       } else {
-         _mm_pause();
-         needRestart = true;
-       }
-     }
-     
-     void writeUnlock() {
-       typeVersionLockObsolete.fetch_add(0b10);
-     }
-     
-     void readUnlockOrRestart(uint64_t startRead, bool &needRestart) const {
-       needRestart = (startRead != typeVersionLockObsolete.load());
-     }
-   };
-   
-   struct SegmentIndexRange {
-     size_t start;
-     size_t end;
-   };
-   
-   // Promoted segments data structures
-   static const size_t MAX_PROMOTED_SEGMENTS = SPLIT_THRESHOLD;  // Maximum 32 promoted segments
-   PromotedSegmentsLock promoted_lock;  // Read-write version lock for promoted segments arrays
-   std::vector<uint8_t> promoted_bitmap;  // Bitmap: 1 if child has promoted segments, 0 otherwise
-   std::vector<ribtree::Segment<Key, Value>*> promoted_segments;  // Array of promoted segments
-   std::vector<SegmentIndexRange> promoted_index;  // Index array: range for each child node
-   size_t promoted_segment_count;  // Current count of promoted segments (max index + 1)
-   size_t promoted_child_count;  // Number of child nodes (leaf nodes at root level)
-   
    // Map to store keys_count for each segment (from config file)
    std::unordered_map<ribtree::Segment<Key, Value>*, size_t> segment_keys_count_map;
 
    BTree(int num_threads = 1, double uThreshold = 0.5, double oThreshold = 0.1) 
-      : thread_num(num_threads), underflowThreshold(uThreshold), overflowThreshold(oThreshold),
-        promoted_segment_count(0), promoted_child_count(0) {
+      : thread_num(num_threads), underflowThreshold(uThreshold), overflowThreshold(oThreshold) {
       // Initialize ThreadIdManager for Segment operations
       ribtree::ThreadIdManager::initialize(num_threads);
       
@@ -401,9 +353,6 @@ struct BTree {
       leaf->isBulkLoading = false;  // Start in normal mode (SPLIT_THRESHOLD threshold)
       root = leaf;
       isBulkLoading.store(false);  // Initially in normal mode
-      
-      // Initialize promoted segments arrays
-      promoted_segments.resize(MAX_PROMOTED_SEGMENTS, nullptr);
    }
 
   // Bulk load function: load segments from config file, build tree, then insert key-value pairs
@@ -624,15 +573,6 @@ struct BTree {
     leafEntry.is_inner = false;
     path.push_back(leafEntry);
 
-    // Check promoted segments first (if root is inner node, we need to find which child this leaf belongs to)
-    // For now, we'll check after we have the leaf - we need to determine child_index
-    // This is a simplified approach - in full implementation, we'd track child_index during traversal
-    // size_t child_index = SIZE_MAX;  // Will be determined if needed - currently unused
-    
-    // Try to find in promoted segments (only if we have a way to determine child_index)
-    // For now, we'll skip this check and go directly to leaf segments
-    // TODO: Implement proper child_index tracking during traversal
-
     // Check if any segment in this leaf is currently splitting
     for (unsigned i = 0; i < leaf->count; i++) {
       if (leaf->segments[i] && leaf->segments[i]->is_currently_splitting()) {
@@ -799,35 +739,6 @@ struct BTree {
           }
         }
 	goto restart;
-      }
-
-      // Check if this segment is promoted to root - if so, remove it first
-      // We need to find child_index for this leaf
-      size_t child_index = findChildIndexForLeaf(leaf);
-      if (child_index != SIZE_MAX) {
-        // Check if this segment is in promoted segments
-        bool needRestart_promoted = false;
-        uint64_t version_promoted = promoted_lock.readLockOrRestart(needRestart_promoted);
-        if (!needRestart_promoted && child_index < promoted_child_count && 
-            promoted_bitmap[child_index] == 1) {
-          // Check if seg is in promoted segments for this child
-          SegmentIndexRange range = promoted_index[child_index];
-          bool is_promoted = false;
-          for (size_t i = range.start; i <= range.end; i++) {
-            if (promoted_segments[i] == seg) {
-              is_promoted = true;
-              break;
-            }
-          }
-          promoted_lock.readUnlockOrRestart(version_promoted, needRestart_promoted);
-          
-          if (is_promoted) {
-            // Remove from promoted segments before splitting
-            removePromotedSegment(seg, child_index);
-          }
-        } else if (!needRestart_promoted) {
-          promoted_lock.readUnlockOrRestart(version_promoted, needRestart_promoted);
-        }
       }
 
       // Now perform segment split (with write lock held, leaf cannot be modified by others)
@@ -1468,9 +1379,6 @@ struct BTree {
     std::cout << std::endl;  // New line after progress bar
     std::cout << "[BUILD_TREE] Step 1 complete: Created " << leaf_nodes.size() << " leaf nodes" << std::endl;
     
-    // Step 1.5: Select and promote top segments to root
-    promoteTopSegmentsToRoot(leaf_nodes);
-    
     // Step 2: Build inner nodes level by level (16 children per inner node)
     std::cout << "[BUILD_TREE] Step 2: Building inner nodes level by level..." << std::endl;
     std::vector<NodeBase*> current_level;
@@ -1569,274 +1477,6 @@ struct BTree {
     std::cout << "[BUILD_TREE] Step 3: Setting root (level " << level << ")" << std::endl;
     root = current_level[0];
     std::cout << "[BUILD_TREE] Tree building complete!" << std::endl;
-  }
-
-  // Select and promote top segments to root based on keys_count
-  void promoteTopSegmentsToRoot(const std::vector<BTreeLeaf<Key,Value>*>& leaf_nodes) {
-    if (leaf_nodes.empty()) return;
-    
-    std::cout << "[PROMOTE] Selecting top " << MAX_PROMOTED_SEGMENTS << " segments to promote to root..." << std::endl;
-    
-    // Step 1: Collect all segments with their keys_count and child index
-    struct SegmentInfo {
-      ribtree::Segment<Key, Value>* seg;
-      size_t child_index;  // Which leaf node (child) this segment belongs to
-      size_t keys_count;   // Number of keys in this segment
-      Key lower_bound;      // Segment lower bound for sorting
-    };
-    
-    std::vector<SegmentInfo> all_segments;
-    for (size_t child_idx = 0; child_idx < leaf_nodes.size(); child_idx++) {
-      auto* leaf = leaf_nodes[child_idx];
-      for (unsigned i = 0; i < leaf->count; i++) {
-        if (leaf->segments[i] != nullptr) {
-          SegmentInfo info;
-          info.seg = leaf->segments[i];
-          info.child_index = child_idx;
-          info.lower_bound = leaf->keys[i];
-          // Get keys_count from map (stored during loadConfigByFile)
-          auto it = segment_keys_count_map.find(leaf->segments[i]);
-          info.keys_count = (it != segment_keys_count_map.end()) ? it->second : 0;
-          all_segments.push_back(info);
-        }
-      }
-    }
-    
-    // Step 2: Sort by keys_count (descending), then select top MAX_PROMOTED_SEGMENTS
-    // Note: We need keys_count from config file, but for now we'll use segment size as proxy
-    // In real implementation, we should have stored keys_count during loadConfigByFile
-    std::sort(all_segments.begin(), all_segments.end(), 
-              [](const SegmentInfo& a, const SegmentInfo& b) {
-                // Sort by keys_count descending, then by lower_bound for stability
-                if (a.keys_count != b.keys_count) {
-                  return a.keys_count > b.keys_count;
-                }
-                return a.lower_bound < b.lower_bound;
-              });
-    
-    size_t promote_count = std::min(MAX_PROMOTED_SEGMENTS, all_segments.size());
-    
-    // Step 3: Initialize promoted segments arrays
-    bool needRestart = false;
-    promoted_lock.writeLockOrRestart(needRestart);
-    if (needRestart) {
-      std::cerr << "[PROMOTE] ERROR: Failed to acquire write lock" << std::endl;
-      return;
-    }
-    
-    promoted_child_count = leaf_nodes.size();
-    promoted_bitmap.resize(promoted_child_count, 0);
-    promoted_index.resize(promoted_child_count);
-    promoted_segment_count = 0;
-    
-    // Step 4: Insert promoted segments and update arrays
-    std::vector<size_t> child_segment_counts(promoted_child_count, 0);  // Count segments per child
-    
-    for (size_t i = 0; i < promote_count; i++) {
-      const auto& info = all_segments[i];
-      size_t pos = promoted_segment_count++;
-      
-      if (pos >= MAX_PROMOTED_SEGMENTS) {
-        std::cerr << "[PROMOTE] WARNING: Exceeded MAX_PROMOTED_SEGMENTS" << std::endl;
-        break;
-      }
-      
-      promoted_segments[pos] = info.seg;
-      
-      // Update bitmap and index
-      if (promoted_bitmap[info.child_index] == 0) {
-        // First segment for this child
-        promoted_bitmap[info.child_index] = 1;
-        promoted_index[info.child_index] = {start: pos, end: pos};
-        child_segment_counts[info.child_index] = 1;
-      } else {
-        // Additional segment for this child - extend range
-        promoted_index[info.child_index].end = pos;
-        child_segment_counts[info.child_index]++;
-      }
-    }
-    
-    promoted_lock.writeUnlock();
-    
-    // Print detailed promotion information
-    std::cout << "[PROMOTE] ========== Promotion Summary ==========" << std::endl;
-    std::cout << "[PROMOTE] Total segments promoted: " << promoted_segment_count << " / " << MAX_PROMOTED_SEGMENTS << std::endl;
-    std::cout << "[PROMOTE] Total child nodes: " << promoted_child_count << std::endl;
-    std::cout << "[PROMOTE] Children with promoted segments: ";
-    size_t children_with_promoted = 0;
-    for (size_t i = 0; i < promoted_child_count; i++) {
-      if (promoted_bitmap[i] == 1) {
-        children_with_promoted++;
-      }
-    }
-    std::cout << children_with_promoted << std::endl;
-    std::cout << "[PROMOTE] -----------------------------------------" << std::endl;
-    
-    // Print detailed information for each child
-    for (size_t i = 0; i < promoted_child_count; i++) {
-      if (promoted_bitmap[i] == 1) {
-        SegmentIndexRange range = promoted_index[i];
-        std::cout << "[PROMOTE] Child[" << i << "]: " << child_segment_counts[i] 
-                  << " segment(s) promoted" << std::endl;
-        std::cout << "[PROMOTE]   Index range: [" << range.start << ", " << range.end << "]" << std::endl;
-        std::cout << "[PROMOTE]   Segments: ";
-        
-        // Print segment details
-        for (size_t j = range.start; j <= range.end; j++) {
-          if (promoted_segments[j] != nullptr) {
-            auto* seg = promoted_segments[j];
-            auto it = segment_keys_count_map.find(seg);
-            size_t keys_count = (it != segment_keys_count_map.end()) ? it->second : 0;
-            std::cout << "[" << seg->lower_bound << "," << seg->upper_bound << ")"
-                      << "(keys=" << keys_count << ") ";
-          }
-        }
-        std::cout << std::endl;
-      }
-    }
-    
-    // Print top segments by keys_count
-    std::cout << "[PROMOTE] -----------------------------------------" << std::endl;
-    std::cout << "[PROMOTE] Top " << std::min(promote_count, size_t(10)) << " segments by keys_count:" << std::endl;
-    for (size_t i = 0; i < std::min(promote_count, size_t(10)); i++) {
-      const auto& info = all_segments[i];
-      std::cout << "[PROMOTE]   #" << (i+1) << ": Child[" << info.child_index 
-                << "] segment [" << info.lower_bound << "," << info.seg->upper_bound 
-                << ") keys_count=" << info.keys_count << std::endl;
-    }
-    
-    std::cout << "[PROMOTE] =========================================" << std::endl;
-  }
-  
-  // Find segment in promoted segments array
-  ribtree::Segment<Key, Value>* findPromotedSegment(Key k, size_t child_index) {
-    if (child_index >= promoted_child_count || promoted_bitmap[child_index] == 0) {
-      return nullptr;
-    }
-    
-    bool needRestart = false;
-    uint64_t version = promoted_lock.readLockOrRestart(needRestart);
-    if (needRestart) {
-      return nullptr;  // Lock failed, retry later
-    }
-    
-    // Get index range for this child
-    SegmentIndexRange range = promoted_index[child_index];
-    
-    // Binary search in the range (skip nullptr)
-    ribtree::Segment<Key, Value>* found = nullptr;
-    size_t left = range.start;
-    size_t right = range.end;
-    
-    while (left <= right) {
-      size_t mid = left + (right - left) / 2;
-      
-      // Skip nullptr
-      while (mid <= right && promoted_segments[mid] == nullptr) {
-        mid++;
-      }
-      if (mid > right) {
-        right = mid - 1;
-        continue;
-      }
-      
-      auto* seg = promoted_segments[mid];
-      if (k >= seg->lower_bound && k < seg->upper_bound) {
-        found = seg;
-        break;
-      } else if (k < seg->lower_bound) {
-        right = mid - 1;
-      } else {
-        left = mid + 1;
-      }
-    }
-    
-    promoted_lock.readUnlockOrRestart(version, needRestart);
-    if (needRestart) {
-      return nullptr;  // Version changed, retry
-    }
-    
-    return found;
-  }
-  
-  // Find child index for a leaf node (by traversing from root)
-  size_t findChildIndexForLeaf(BTreeLeaf<Key, Value>* target_leaf) {
-    // This is a simplified implementation - in practice, we might want to cache this
-    // or track it during traversal. For now, we'll search from root.
-    if (promoted_child_count == 0) {
-      return SIZE_MAX;
-    }
-    
-    NodeBase* node = root;
-    size_t child_index = 0;
-    
-    // Traverse to find which leaf index this is
-    // This is inefficient but works for now
-    std::function<size_t(NodeBase*, size_t&)> countLeaves = [&](NodeBase* n, size_t& index) -> size_t {
-      if (n->type == PageType::BTreeLeaf) {
-        if (static_cast<BTreeLeaf<Key,Value>*>(n) == target_leaf) {
-          return index++;
-        }
-        return index++;
-      } else {
-        auto* inner = static_cast<BTreeInner<Key>*>(n);
-        size_t count = 0;
-        for (unsigned i = 0; i <= inner->count; i++) {
-          count += countLeaves(inner->children[i], index);
-          if (index > child_index && static_cast<BTreeLeaf<Key,Value>*>(inner->children[i]) == target_leaf) {
-            child_index = index - 1;
-            return count;
-          }
-        }
-        return count;
-      }
-    };
-    
-    size_t idx = 0;
-    countLeaves(node, idx);
-    
-    if (child_index < promoted_child_count) {
-      return child_index;
-    }
-    return SIZE_MAX;
-  }
-  
-  // Remove segment from promoted segments array
-  void removePromotedSegment(ribtree::Segment<Key, Value>* seg, size_t child_index) {
-    if (child_index >= promoted_child_count || promoted_bitmap[child_index] == 0) {
-      return;
-    }
-    
-    bool needRestart = false;
-    promoted_lock.writeLockOrRestart(needRestart);
-    if (needRestart) {
-      return;  // Lock failed, retry later
-    }
-    
-    // Find and remove the segment
-    SegmentIndexRange range = promoted_index[child_index];
-    for (size_t i = range.start; i <= range.end; i++) {
-      if (promoted_segments[i] == seg) {
-        promoted_segments[i] = nullptr;  // Mark as deleted
-        
-        // Check if this child has any other segments
-        bool has_other = false;
-        for (size_t j = range.start; j <= range.end; j++) {
-          if (promoted_segments[j] != nullptr) {
-            has_other = true;
-            break;
-          }
-        }
-        
-        if (!has_other) {
-          promoted_bitmap[child_index] = 0;
-        }
-        
-        break;
-      }
-    }
-    
-    promoted_lock.writeUnlock();
   }
 
   // Load segments from config file and build tree structure
@@ -1942,7 +1582,7 @@ struct BTree {
       try {
         auto* seg = new ribtree::Segment<Key, Value>(lower, upper, box_range, thread_num);
         segment_list.push_back({lower, seg});  // Store (lower_bound, segment) pair
-        // Store keys_count in map for later use in promotion
+        // Store keys_count in map (read from config file)
         segment_keys_count_map[seg] = keys_count;
         segment_count++;
       } catch (const std::exception& e) {
