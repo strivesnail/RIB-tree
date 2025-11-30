@@ -78,14 +78,17 @@ Example:
 Use the `partition_optimize` tool to generate segment configuration files from input data:
 
 ```bash
-cd config_generator
-g++ -std=c++20 -O3 -o partition_optimize partition_optimize.cpp
-./partition_optimize <input_file> <output_file>
+# Build the tool
+make partition_optimize
+
+# Run the tool
+./config_generator/partition_optimize <input_file> <output_file>
 ```
 
 Example:
 ```bash
-./partition_optimize w106.csv ../configs/segments_w106.csv
+make partition_optimize
+./config_generator/partition_optimize w106.csv configs/segments_w106.csv
 ```
 
 The tool processes input data and generates a CSV configuration file with segment boundaries, box ranges, and key counts.
