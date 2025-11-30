@@ -16,6 +16,7 @@
 #include <chrono>
 #include <mutex>
 #include <unordered_map>
+#include <functional>
 #include "rib_segment.h"
 
 // B+ Tree split threshold configuration
@@ -626,7 +627,7 @@ struct BTree {
     // Check promoted segments first (if root is inner node, we need to find which child this leaf belongs to)
     // For now, we'll check after we have the leaf - we need to determine child_index
     // This is a simplified approach - in full implementation, we'd track child_index during traversal
-    size_t child_index = SIZE_MAX;  // Will be determined if needed
+    // size_t child_index = SIZE_MAX;  // Will be determined if needed - currently unused
     
     // Try to find in promoted segments (only if we have a way to determine child_index)
     // For now, we'll skip this check and go directly to leaf segments
@@ -910,7 +911,7 @@ struct BTree {
                             const std::vector<std::pair<Key, ribtree::Segment<Key, Value>*>>& new_segments,
                             ribtree::Segment<Key, Value>* old_segment,
                             std::vector<PathEntry>& path,
-                            uint64_t& versionNode) {
+                            [[maybe_unused]] uint64_t& versionNode) {
     // Verify segment is still at the same position
     if (oldSegPos >= leaf->count || leaf->segments[oldSegPos] != old_segment) {
       std::cout << "[REPLACE_SEGMENTS] ERROR: Segment position changed! oldSegPos=" << oldSegPos 
@@ -944,7 +945,7 @@ struct BTree {
     }
     
     // Step 1: Remove old segment
-    for (unsigned i = oldSegPos; i < leaf->count - 1; i++) {
+    for (unsigned i = oldSegPos; i < static_cast<unsigned>(leaf->count) - 1; i++) {
       leaf->keys[i] = leaf->keys[i + 1];
       leaf->segments[i] = leaf->segments[i + 1];
     }
@@ -1895,8 +1896,9 @@ struct BTree {
       if (line.empty()) continue;
       std::istringstream iss(line);
       std::string token = "";
-      Key lower, upper;
-      size_t box_range;
+      Key lower = Key{};  // Initialize to default value
+      Key upper = Key{};  // Initialize to default value
+      size_t box_range = 0;
       size_t keys_count = 0;  // Optional field, default to 0 if not present
 
       if (getline(iss, token, ',')) {

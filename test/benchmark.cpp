@@ -295,7 +295,7 @@ int main (int argc, char* argv[]) {
                 count++;
                 
                 // Print progress bar every 1%
-                if (count % progress_interval == 0 || count == actual_total) {
+                if (count % progress_interval == 0 || static_cast<size_t>(count) == actual_total) {
                     auto current_time = chrono::high_resolution_clock::now();
                     long long elapsed = chrono::duration_cast<chrono::milliseconds>(current_time - start_time).count();
                     double progress = 100.0 * count / actual_total;
@@ -342,7 +342,7 @@ int main (int argc, char* argv[]) {
                 count++;
                 
                 // Print progress bar every 1%
-                if (count % progress_interval == 0 || count == actual_total) {
+                if (count % progress_interval == 0 || static_cast<size_t>(count) == actual_total) {
                     auto current_time = chrono::high_resolution_clock::now();
                     long long elapsed = chrono::duration_cast<chrono::milliseconds>(current_time - start_time).count();
                     double progress = 100.0 * count / actual_total;
@@ -395,7 +395,7 @@ int main (int argc, char* argv[]) {
     int num_lookups_per_batch = batch_size - num_inserts_per_batch;
     double cumulative_insert_time = 0;
     double cumulative_lookup_time = 0;
-    double cumulative_total_mops;
+    double cumulative_total_mops = 0.0;
 
     int batch_no = 0;
     while (true) {
