@@ -20,6 +20,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <type_traits>
 #include <mutex>
 #include <random>
 #include <stdexcept>
@@ -315,9 +316,46 @@ class Box {
         version_lock_.store(new_version, std::memory_order_release);
     }
 
+    // Hash the entire key to 8 bits using CRC32 (faster than modulo)
+    inline uint8_t hashKeyToByte(KeyType key) const {
+        // if constexpr (sizeof(KeyType) == 8) {
+        uint32_t crc = _mm_crc32_u64(0, static_cast<uint64_t>(key));
+        uint8_t hash = crc & 0xFF;
+        return (hash == 0) ? 1 : hash;  // Avoid 0
+        // } else if constexpr (sizeof(KeyType) == 4) {
+        //     uint32_t crc = _mm_crc32_u32(0, static_cast<uint32_t>(key));
+        //     uint8_t hash = crc & 0xFF;
+        //     return (hash == 0) ? 1 : hash;  // Avoid 0
+        // } else {
+        //     // Fallback for other sizes
+        //     uint8_t key_low = static_cast<uint8_t>(key & 0xFF);
+        //     uint32_t crc = _mm_crc32_u8(0, key_low);
+        //     uint8_t hash = crc & 0xFF;
+        //     return (hash == 0) ? 1 : hash;  // Avoid 0
+        // }
+    }
+
     size_t findKeyIndex(KeyType key) const {
-        uint8_t key_low = key & 0xFF;
-        uint8_t target_low = ((key_low * 251) % 255) + 1;
+        // Prefetch valid_flags at the beginning (one cache line, cheap)
+        // This overlaps with the hash calculation below
+        __builtin_prefetch(&valid_flags, 0, 3);
+        
+        uint8_t target_low = hashKeyToByte(key);
+
+        // Prefetch a relevant cache line of keys based on the hash
+        // keys array spans multiple cache lines (64 elements * sizeof(KeyType))
+        // Group into bins: use hash to predict which cache line might be accessed
+        // Cache line size is 64 bytes
+        constexpr size_t cache_line_size = 64;
+        constexpr size_t elements_per_cache_line = cache_line_size / sizeof(KeyType);
+        constexpr size_t num_cache_lines = (maxKey * sizeof(KeyType) + cache_line_size - 1) / cache_line_size;
+        
+        // Use hash to predict which bin (cache line) might be accessed
+        size_t predicted_bin = target_low % num_cache_lines;
+        size_t prefetch_offset = predicted_bin * elements_per_cache_line;
+        if (prefetch_offset < maxKey) {
+            __builtin_prefetch(&keys[prefetch_offset], 0, 3);
+        }
 
         __m512i v_target_low = _mm512_set1_epi8(target_low);
         __m512i v_keys_low = _mm512_load_si512(reinterpret_cast<const __m512i*>(keys_low.data()));
@@ -325,10 +363,19 @@ class Box {
 
         while (mask_low) {
             size_t candidate = __builtin_ctzll(mask_low);
-            mask_low &= mask_low - 1;
-            if (keys[candidate] == key && valid_flags[candidate] && candidate < maxSize) {
+            
+            // Test flags first (one cache line, already prefetched)
+            // This is useful when it's a mismatch so keys array can be skipped
+            if (!valid_flags[candidate] || candidate >= maxSize) {
+                mask_low &= mask_low - 1;
+                continue;
+            }
+            
+            // Now check keys
+            if (keys[candidate] == key) {
                 return candidate;
             }
+            mask_low &= mask_low - 1;
         }
         return maxKey;
     }
@@ -557,8 +604,7 @@ class Box {
 
         keys[nearestEmptySlot] = key;
         values[nearestEmptySlot] = value;
-        uint8_t key_low = key & 0xFF;
-        keys_low[nearestEmptySlot] = ((key_low * 251) % 255) + 1;
+        keys_low[nearestEmptySlot] = hashKeyToByte(key);
         valid_flags[nearestEmptySlot] = true;
         validSize++;
         if (nearestEmptySlot == maxSize) {
@@ -609,7 +655,9 @@ class Box {
 #endif
 
         size_t index = findKeyIndex(key);
-        ValueType result_value = -1;
+        // Use type-safe default value for NOT_FOUND
+        ValueType result_value = std::is_signed_v<ValueType> ? 
+            static_cast<ValueType>(-1) : static_cast<ValueType>(0);
         SearchStatus status = SearchStatus::NOT_FOUND;
 
         if (index != maxKey) {
@@ -821,6 +869,25 @@ public:
         size_t logical_box_index = getLogicalBoxIndex(key);
         uint8_t current_position = logical_box_write_positions[logical_box_index].load(std::memory_order_acquire);
 
+        // First, check if key already exists in boxes 0 to current_position (update operation)
+        for (uint8_t pos = 0; pos <= current_position && pos < PHYSICAL_BOXES_PER_LOGICAL; pos++) {
+            size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, pos);
+            Box<KeyType, ValueType>* box = first_box_ptr + physical_box_index;
+            
+            // Search for key in this box
+            size_t key_index = box->searchUpdateKey(key);
+            if (key_index != maxKey) {
+                // Key found - update the value
+                InsertResult update_result = box->updateValue(key_index, value);
+                if (update_result.status == InsertStatus::SUCCESS) {
+                    leave();
+                    return {InsertStatus::SUCCESS, static_cast<int>(logical_box_index)};
+                }
+                // If update failed, continue to try insert (should not happen, but handle gracefully)
+            }
+        }
+
+        // Key not found in existing boxes - perform insert operation
         while (current_position < PHYSICAL_BOXES_PER_LOGICAL) {
             size_t physical_box_index = getPhysicalBoxIndex(logical_box_index, current_position);
 
@@ -886,7 +953,11 @@ public:
             }
         }
         
-        return {SearchStatus::NOT_FOUND, -1};
+        // Use type-safe default value for NOT_FOUND
+        // For signed types, use -1; for unsigned types, use 0
+        ValueType not_found_value = std::is_signed_v<ValueType> ? 
+            static_cast<ValueType>(-1) : static_cast<ValueType>(0);
+        return {SearchStatus::NOT_FOUND, not_found_value};
     }
 
 

@@ -27,6 +27,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <type_traits>
 
 #include "src/btreeolc.h"
 
@@ -80,8 +81,8 @@ bool get_boolean_flag (const FlagMap& flags, const string& key) {
 // Main process: Read data, perform partition optimization, build index,
 // execute operations, and perform local dynamic adjustments
 //==============================================
-using KeyType = int64_t;
-using ValueType = int64_t; 
+using KeyType = uint64_t;
+using ValueType = uint64_t; 
 
 vector<pair<KeyType, KeyType>> read_range_queries(const string& range_file_path) {
     vector<pair<KeyType, KeyType>> range_queries;
@@ -101,8 +102,15 @@ vector<pair<KeyType, KeyType>> read_range_queries(const string& range_file_path)
         }
         
         try {
-            KeyType start_key = stoll(line.substr(0, comma_pos));
-            KeyType end_key = stoll(line.substr(comma_pos + 1));
+            // Use appropriate conversion function based on KeyType
+            KeyType start_key, end_key;
+            if constexpr (std::is_signed_v<KeyType>) {
+                start_key = static_cast<KeyType>(stoll(line.substr(0, comma_pos)));
+                end_key = static_cast<KeyType>(stoll(line.substr(comma_pos + 1)));
+            } else {
+                start_key = static_cast<KeyType>(stoull(line.substr(0, comma_pos)));
+                end_key = static_cast<KeyType>(stoull(line.substr(comma_pos + 1)));
+            }
             
             if (start_key <= end_key) {
                 range_queries.push_back({start_key, end_key});
@@ -148,7 +156,13 @@ vector<pair<KeyType, int>> read_scan_queries(const string& scan_file_path) {
         }
         
         try {
-            KeyType start_key = stoll(line.substr(0, comma_pos));
+            // Use appropriate conversion function based on KeyType
+            KeyType start_key;
+            if constexpr (std::is_signed_v<KeyType>) {
+                start_key = static_cast<KeyType>(stoll(line.substr(0, comma_pos)));
+            } else {
+                start_key = static_cast<KeyType>(stoull(line.substr(0, comma_pos)));
+            }
             int scan_count = stoi(line.substr(comma_pos + 1));
             
             if (scan_count > 0) {
@@ -277,7 +291,8 @@ int main (int argc, char* argv[]) {
             streampos file_size = size_check.tellg();
             size_check.close();
             
-            size_t estimated_total = file_size / sizeof(int64_t);
+            // Use KeyType size instead of hardcoded int64_t
+            size_t estimated_total = file_size / sizeof(KeyType);
             size_t actual_total = min(static_cast<size_t>(total_num_keys), estimated_total);
             
             ifstream fin (keys_file_path, ios::binary);
@@ -285,12 +300,12 @@ int main (int argc, char* argv[]) {
                 throw runtime_error ("Unable to open file: " + keys_file_path);
             }
             
-            int64_t num;
+            KeyType num;
             int count = 0;
             size_t progress_interval = max(static_cast<size_t>(1), actual_total / 100);  // Update every 1%
             auto start_time = chrono::high_resolution_clock::now();
             
-            while (fin.read (reinterpret_cast<char*> (&num), sizeof (num)) && count < total_num_keys) {
+            while (fin.read (reinterpret_cast<char*> (&num), sizeof (KeyType)) && count < total_num_keys) {
                 file_keys.push_back (num);
                 count++;
                 
@@ -338,8 +353,31 @@ int main (int argc, char* argv[]) {
             
             while (getline (fin, line) && count < total_num_keys) {
                 if (line.empty ()) continue;
-                file_keys.push_back (stoll (line));
-                count++;
+                
+                try {
+                    // Use appropriate conversion function based on KeyType
+                    if constexpr (std::is_signed_v<KeyType>) {
+                        file_keys.push_back (static_cast<KeyType>(stoll (line)));
+                    } else {
+                        file_keys.push_back (static_cast<KeyType>(stoull (line)));
+                    }
+                    count++;
+                } catch (const std::invalid_argument& e) {
+                    cerr << "\n[READ_KEYS] ERROR: Invalid key format at line " << (count + 1) 
+                         << ": '" << line << "'" << endl;
+                    cerr << "  Error: " << e.what() << endl;
+                    throw runtime_error("Failed to read key from file: invalid format");
+                } catch (const std::out_of_range& e) {
+                    cerr << "\n[READ_KEYS] ERROR: Key out of range at line " << (count + 1) 
+                         << ": '" << line << "'" << endl;
+                    cerr << "  Error: " << e.what() << endl;
+                    if constexpr (std::is_signed_v<KeyType>) {
+                        cerr << "  Key value exceeds int64_t range [-9223372036854775808, 9223372036854775807]" << endl;
+                    } else {
+                        cerr << "  Key value exceeds uint64_t range [0, 18446744073709551615]" << endl;
+                    }
+                    throw runtime_error("Failed to read key from file: value out of range");
+                }
                 
                 // Print progress bar every 1%
                 if (count % progress_interval == 0 || static_cast<size_t>(count) == actual_total) {
@@ -367,7 +405,14 @@ int main (int argc, char* argv[]) {
     BTree<KeyType, ValueType> index(thread_num);
     
     // Build initial index using bulk load (16 entries per node, then auto-switch to 32)
-    vector<KeyType> init_keys (file_keys.begin (), file_keys.begin () + init_num_keys);
+    // Limit init_num_keys to actual file size to avoid buffer overflow
+    size_t actual_init_num_keys = min(static_cast<size_t>(init_num_keys), file_keys.size());
+    if (actual_init_num_keys < static_cast<size_t>(init_num_keys)) {
+        cout << "Warning: Requested init_num_keys=" << init_num_keys 
+             << " but file only contains " << file_keys.size() 
+             << " keys. Using " << actual_init_num_keys << " keys instead." << endl;
+    }
+    vector<KeyType> init_keys (file_keys.begin (), file_keys.begin () + actual_init_num_keys);
     
     if (!config_file_path.empty()) {
         // Use config file to pre-load segments, then bulk load key-value pairs
@@ -387,7 +432,7 @@ int main (int argc, char* argv[]) {
         cout << "Initial index built. Now using normal mode (32 entries per node)." << endl;
     }
 
-    int i = init_num_keys;
+    int i = static_cast<int>(actual_init_num_keys);
     long long cumulative_inserts = 0;
     long long cumulative_lookups = 0;
     long long cumulative_found = 0;
@@ -396,6 +441,7 @@ int main (int argc, char* argv[]) {
     double cumulative_insert_time = 0;
     double cumulative_lookup_time = 0;
     double cumulative_total_mops = 0.0;
+    long long last_cumulative_lookups_for_stats = 0;  // Track for batch stats calculation
 
     int batch_no = 0;
     while (true) {
@@ -405,38 +451,57 @@ int main (int argc, char* argv[]) {
         double batch_insert_time = 0.0;
 
         if (num_lookups_per_batch > 0) {
-            vector<KeyType> lookup_keys;
-            random_device rd;
-            mt19937 gen (rd ());
-            uniform_int_distribution<> dis (0, init_num_keys - 1);
-
-            for (int j = 0; j < num_lookups_per_batch; j++) {
-                lookup_keys.push_back (file_keys[dis (gen)]);
+            // Limit lookups based on actual file size and remaining quota
+            int max_lookups_remaining = num_lookups_per_batch;  // Default: no limit
+            if (insert_frac == 0) {
+                // For lookup-only mode, limit total lookups based on user parameter and file size
+                // Allow repeating lookups, but cap total at min(user_param, reasonable_limit)
+                int max_total_lookups = min(total_num_keys, static_cast<int>(file_keys.size()) * 10);  // Allow up to 10x file size for repeats
+                max_lookups_remaining = min(num_lookups_per_batch, 
+                                            max(0, max_total_lookups - static_cast<int>(cumulative_lookups)));
             }
+            
+            int actual_lookups_this_batch = max_lookups_remaining;
+            
+            if (actual_lookups_this_batch > 0) {
+                vector<KeyType> lookup_keys;
+                lookup_keys.reserve(actual_lookups_this_batch);
+                random_device rd;
+                mt19937 gen (rd ());
+                uniform_int_distribution<> dis (0, static_cast<int>(actual_init_num_keys) - 1);
 
-            int batch_found = 0;
-            chrono::high_resolution_clock::time_point lookups_start_time, lookups_end_time;
-            lookups_start_time = chrono::high_resolution_clock::now ();
-            omp_set_num_threads(thread_num);
-            #pragma omp parallel for reduction(+:batch_found)
-            for (int j = 0; j < num_lookups_per_batch; j++) {
-                ValueType result;
-                if (index.lookup(lookup_keys[j], result) && result == lookup_keys[j]) {
-                    batch_found++;
+                for (int j = 0; j < actual_lookups_this_batch; j++) {
+                    lookup_keys.push_back (file_keys[dis (gen)]);
                 }
-            }
-            lookups_end_time = chrono::high_resolution_clock::now ();
 
-            batch_lookup_time =
-                chrono::duration_cast<chrono::nanoseconds> (lookups_end_time - lookups_start_time).count ();
-            cumulative_lookup_time += batch_lookup_time;
-            cumulative_lookups += num_lookups_per_batch;
-            cumulative_found += batch_found;
+                int batch_found = 0;
+                chrono::high_resolution_clock::time_point lookups_start_time, lookups_end_time;
+                lookups_start_time = chrono::high_resolution_clock::now ();
+                omp_set_num_threads(thread_num);
+                #pragma omp parallel for reduction(+:batch_found)
+                for (int j = 0; j < actual_lookups_this_batch; j++) {
+                    ValueType result;
+                    if (index.lookup(lookup_keys[j], result) && result == lookup_keys[j]) {
+                        batch_found++;
+                    }
+                }
+                lookups_end_time = chrono::high_resolution_clock::now ();
+
+                batch_lookup_time =
+                    chrono::duration_cast<chrono::nanoseconds> (lookups_end_time - lookups_start_time).count ();
+                cumulative_lookup_time += batch_lookup_time;
+                cumulative_lookups += actual_lookups_this_batch;
+                cumulative_found += batch_found;
+            } else {
+                batch_lookup_time = 0.0;
+            }
         }
 
-        int num_actual_inserts = min (num_inserts_per_batch, total_num_keys - i);
+        // Limit inserts to available keys in file_keys
+        int available_keys = static_cast<int>(file_keys.size()) - i;
+        int num_actual_inserts = min (num_inserts_per_batch, min(total_num_keys - i, available_keys));
         int num_keys_after_batch = i + num_actual_inserts;
-        if (num_inserts_per_batch > 0) {
+        if (num_inserts_per_batch > 0 && num_actual_inserts > 0) {
             int inserted = 0;
 
             chrono::high_resolution_clock::time_point inserts_start_time, inserts_end_time;
@@ -457,20 +522,27 @@ int main (int argc, char* argv[]) {
         }
 
         if (print_batch_stats) {
-            int num_batch_operations = num_lookups_per_batch + num_actual_inserts;
+            // Calculate actual batch operations (may be less than requested due to file size limits)
+            int actual_lookups_this_batch = static_cast<int>(cumulative_lookups - last_cumulative_lookups_for_stats);
+            last_cumulative_lookups_for_stats = cumulative_lookups;
+            
+            int num_batch_operations = actual_lookups_this_batch + num_actual_inserts;
             double batch_time = batch_lookup_time + batch_insert_time;
             long long cumulative_operations = cumulative_lookups + cumulative_inserts;
             double cumulative_time = cumulative_lookup_time + cumulative_insert_time;
 
-            double batch_lookup_mops = num_lookups_per_batch / batch_lookup_time * 1000;
-            double batch_insert_mops = num_actual_inserts / batch_insert_time * 1000;
-            double batch_total_mops = num_batch_operations / batch_time * 1000;
+            // Avoid division by zero
+            double batch_lookup_mops = (batch_lookup_time > 0) ? actual_lookups_this_batch / batch_lookup_time * 1000 : 0;
+            double batch_insert_mops = (batch_insert_time > 0) ? num_actual_inserts / batch_insert_time * 1000 : 0;
+            double batch_total_mops = (batch_time > 0) ? num_batch_operations / batch_time * 1000 : 0;
 
-            double cumulative_lookup_mops = cumulative_lookups / cumulative_lookup_time * 1000;
-            double cumulative_insert_mops = cumulative_inserts / cumulative_insert_time * 1000;
-            cumulative_total_mops = cumulative_operations / cumulative_time * 1000;
+            double cumulative_lookup_mops = (cumulative_lookup_time > 0) ? cumulative_lookups / cumulative_lookup_time * 1000 : 0;
+            double cumulative_insert_mops = (cumulative_insert_time > 0) ? cumulative_inserts / cumulative_insert_time * 1000 : 0;
+            cumulative_total_mops = (cumulative_time > 0) ? cumulative_operations / cumulative_time * 1000 : 0;
 
-            cout << "Batch " << batch_no << ", cumulative ops: " << cumulative_operations << "\n\tbatch throughput:\t"
+            cout << "Batch " << batch_no << ", cumulative ops: " << cumulative_operations 
+                 << " (lookups: " << cumulative_lookups << ", inserts: " << cumulative_inserts << ")"
+                 << "\n\tbatch throughput:\t"
                  << fixed << setprecision(3) << batch_lookup_mops << " Mop/s (lookups),\t" << batch_insert_mops << " Mop/s (inserts),\t"
                  << batch_total_mops << " Mop/s (total)"
                  << "\n\tcumulative throughput:\t" << cumulative_lookup_mops << " Mop/s (lookups),\t"
@@ -479,11 +551,16 @@ int main (int argc, char* argv[]) {
         }
 
         if (insert_frac == 0) {
-            if (cumulative_lookups >= total_num_keys - init_num_keys) {
+            // For lookup-only mode, limit lookups based on actual file size
+            // Use the minimum of user parameter and available keys
+            int max_lookups = min(total_num_keys - static_cast<int>(actual_init_num_keys), 
+                                  static_cast<int>(file_keys.size()) - static_cast<int>(actual_init_num_keys));
+            if (cumulative_lookups >= max_lookups) {
                 break;
             }
         } else {
-            if (i >= total_num_keys) {
+            // Stop if we've processed all available keys or reached total_num_keys
+            if (i >= total_num_keys || i >= static_cast<int>(file_keys.size())) {
                 break;
             }
         }
@@ -681,25 +758,29 @@ int main (int argc, char* argv[]) {
             
             int num_actual_inserts = 0;
             if (num_inserts_per_batch > 0 && i < total_num_keys) {
-                num_actual_inserts = min(num_inserts_per_batch, total_num_keys - i);
+                // Limit inserts to available keys in file_keys
+                int available_keys = static_cast<int>(file_keys.size()) - i;
+                num_actual_inserts = min(num_inserts_per_batch, min(total_num_keys - i, available_keys));
                 int num_keys_after_batch = i + num_actual_inserts;
                 
-                int inserted = 0;
-                
-                chrono::high_resolution_clock::time_point inserts_start_time, inserts_end_time;
-                inserts_start_time = chrono::high_resolution_clock::now();
-                omp_set_num_threads(thread_num);
-                #pragma omp parallel for reduction(+:inserted)
-                for (int j = i; j < num_keys_after_batch; j++) {
-                    index.insert(file_keys[j], file_keys[j]);  // value = key
-                    inserted++;
+                if (num_actual_inserts > 0) {
+                    int inserted = 0;
+                    
+                    chrono::high_resolution_clock::time_point inserts_start_time, inserts_end_time;
+                    inserts_start_time = chrono::high_resolution_clock::now();
+                    omp_set_num_threads(thread_num);
+                    #pragma omp parallel for reduction(+:inserted)
+                    for (int j = i; j < num_keys_after_batch; j++) {
+                        index.insert(file_keys[j], file_keys[j]);  // value = key
+                        inserted++;
+                    }
+                    inserts_end_time = chrono::high_resolution_clock::now();
+                    
+                    batch_insert_time = chrono::duration_cast<chrono::nanoseconds>(inserts_end_time - inserts_start_time).count();
+                    cumulative_insert_time += batch_insert_time;
+                    cumulative_inserts += inserted;
+                    i = num_keys_after_batch;
                 }
-                inserts_end_time = chrono::high_resolution_clock::now();
-                
-                batch_insert_time = chrono::duration_cast<chrono::nanoseconds>(inserts_end_time - inserts_start_time).count();
-                cumulative_insert_time += batch_insert_time;
-                cumulative_inserts += inserted;
-                i = num_keys_after_batch;
             }
             
             if (print_batch_stats) {

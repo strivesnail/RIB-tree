@@ -14,6 +14,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <chrono>
+#include <thread>
 #include <mutex>
 #include <unordered_map>
 #include <functional>
@@ -23,7 +24,7 @@
 // This threshold applies to all levels (leaf nodes and inner nodes)
 // When a node's count reaches this threshold, it will be split
 #ifndef SPLIT_THRESHOLD
-#define SPLIT_THRESHOLD 32
+#define SPLIT_THRESHOLD 256
 #endif
 
 namespace ribtree {
@@ -99,10 +100,10 @@ struct BTreeLeafBase : public NodeBase {
 
 template<class Key,class Value>
 struct BTreeLeaf : public BTreeLeafBase {
-   static const uint64_t maxEntries = 128;  // Maximum capacity: 128 segments (increased from 32 to prevent overflow)
+   static const uint64_t maxEntries = 256;  // Maximum capacity: 256 segments (SPLIT_THRESHOLD=256)
    // Note: bulkLoadMax is not a threshold, but a building standard for bulk load
-   // During bulk load, we build nodes with exactly 16 segments per leaf
-   uint64_t bulkLoadMax = 16;  // Building standard: 16 segments per leaf during bulk load
+   // During bulk load, we build nodes with exactly (SPLIT_THRESHOLD - 1) segments per leaf
+   uint64_t bulkLoadMax = SPLIT_THRESHOLD - 1;  // Building standard: (SPLIT_THRESHOLD - 1) segments per leaf during bulk load
    bool isBulkLoading = false;  // Flag to indicate bulk load mode (for tracking purposes)
 
    Key keys[maxEntries];  // Keys for locating segments (segment start keys)
@@ -118,7 +119,7 @@ struct BTreeLeaf : public BTreeLeafBase {
    }
 
    bool isFull() { 
-      // Note: During bulk load, nodes are built with exactly 16 segments per leaf
+      // Note: During bulk load, nodes are built with exactly (SPLIT_THRESHOLD - 1) segments per leaf
       // So isFull() should never be true during bulk load
       if (isBulkLoading) {
         return false;  // Never full during bulk load
@@ -202,7 +203,7 @@ struct BTreeLeaf : public BTreeLeafBase {
   void insert(Key k, ribtree::Segment<Key, Value>* seg) {
     assert(seg != nullptr);
     // Note: In normal mode, node splitting will handle overflow
-    // During bulk load, nodes are built with exactly 16 segments, so this should not overflow
+    // During bulk load, nodes are built with exactly (SPLIT_THRESHOLD - 1) segments, so this should not overflow
     if (count) {
       unsigned pos=lowerBound(k);
       if ((pos<count) && (keys[pos]==k)) {
@@ -243,10 +244,10 @@ struct BTreeInnerBase : public NodeBase {
 
 template<class Key>
 struct BTreeInner : public BTreeInnerBase {
-   static const uint64_t maxEntries = 128;  // Maximum capacity: 128 children (increased from 32 to prevent overflow)
+   static const uint64_t maxEntries = 256;  // Maximum capacity: 256 children (SPLIT_THRESHOLD=256)
    // Note: bulkLoadMax is not a threshold, but a building standard for bulk load
-   // During bulk load, we build nodes with exactly 16 children per inner node
-   uint64_t bulkLoadMax = 16;  // Building standard: 16 children per inner node during bulk load
+   // During bulk load, we build nodes with exactly (SPLIT_THRESHOLD - 1) children per inner node
+   uint64_t bulkLoadMax = SPLIT_THRESHOLD - 1;  // Building standard: (SPLIT_THRESHOLD - 1) children per inner node during bulk load
    bool isBulkLoading = false;  // Flag to indicate bulk load mode (for tracking purposes)
 
    NodeBase* children[maxEntries];
@@ -259,7 +260,7 @@ struct BTreeInner : public BTreeInnerBase {
    }
 
    bool isFull() { 
-      // Note: During bulk load, nodes are built with exactly 16 children per inner node
+      // Note: During bulk load, nodes are built with exactly (SPLIT_THRESHOLD - 1) children per inner node
       // So isFull() should never be true during bulk load
       if (isBulkLoading) {
         return false;  // Never full during bulk load
@@ -313,7 +314,9 @@ struct BTreeInner : public BTreeInnerBase {
    void insert(Key k,NodeBase* child) {
       assert(count<maxEntries-1);
       unsigned pos=lowerBound(k);
-      memmove(keys+pos+1,keys+pos,sizeof(Key)*(count-pos+1));
+      // Move keys: count-pos keys from pos to pos+1
+      memmove(keys+pos+1,keys+pos,sizeof(Key)*(count-pos));
+      // Move children: count-pos+1 children from pos to pos+1 (one more child than keys)
       memmove(children+pos+1,children+pos,sizeof(NodeBase*)*(count-pos+1));
       keys[pos]=k;
       children[pos]=child;
@@ -361,7 +364,7 @@ struct BTree {
       std::cout << "[BULK LOAD] Config file: " << config_file << ", data size: " << data.size() << std::endl;
       std::cout.flush();
       
-      // Step 1: Load segments and build tree (16 segments per leaf, 16 children per inner node)
+       // Step 1: Load segments and build tree ((SPLIT_THRESHOLD - 1) segments per leaf, (SPLIT_THRESHOLD - 1) children per inner node)
       std::cout << "[BULK LOAD] Loading segments from config file..." << std::endl;
       std::cout.flush();
       loadConfigByFile(config_file);
@@ -429,7 +432,7 @@ struct BTree {
       */
       
       // Step 4: Disable bulk load mode (switch to normal mode for future operations)
-      // Note: Normal mode allows up to 128 segments/children, but node splitting is disabled
+      // Note: Normal mode allows up to 256 segments/children, but node splitting is disabled
       // Update all nodes to normal mode
       std::cout << "[BULK LOAD] Switching to normal mode..." << std::endl;
       std::function<void(NodeBase*)> setNormalMode = [&](NodeBase* node) {
@@ -1332,16 +1335,16 @@ struct BTree {
   }
 
   // Build tree structure from segments in bulk
-  // Building standard: 16 segments per leaf, 16 children per inner node
+  // Building standard: (SPLIT_THRESHOLD - 1) segments per leaf, (SPLIT_THRESHOLD - 1) children per inner node
   // This is not a threshold - nodes are built by grouping segments/children according to this standard
   void buildTreeFromSegments(const std::vector<std::pair<Key, ribtree::Segment<Key, Value>*>>& segment_list) {
     if (segment_list.empty()) return;
     
-    const size_t BULK_LOAD_MAX = 16;  // Building standard: 16 segments per leaf, 16 children per inner
+    const size_t BULK_LOAD_MAX = SPLIT_THRESHOLD - 1;  // Building standard: (SPLIT_THRESHOLD - 1) segments per leaf, (SPLIT_THRESHOLD - 1) children per inner
     
     std::cout << "[BUILD_TREE] Starting to build tree from " << segment_list.size() << " segments" << std::endl;
     
-    // Step 1: Build leaf nodes (each leaf contains up to 16 segments)
+    // Step 1: Build leaf nodes (each leaf contains up to (SPLIT_THRESHOLD - 1) segments)
     std::vector<BTreeLeaf<Key,Value>*> leaf_nodes;
     size_t total_segments = segment_list.size();
     size_t total_leaves = (total_segments + BULK_LOAD_MAX - 1) / BULK_LOAD_MAX;
@@ -1379,7 +1382,7 @@ struct BTree {
     std::cout << std::endl;  // New line after progress bar
     std::cout << "[BUILD_TREE] Step 1 complete: Created " << leaf_nodes.size() << " leaf nodes" << std::endl;
     
-    // Step 2: Build inner nodes level by level (16 children per inner node)
+    // Step 2: Build inner nodes level by level ((SPLIT_THRESHOLD - 1) children per inner node)
     std::cout << "[BUILD_TREE] Step 2: Building inner nodes level by level..." << std::endl;
     std::vector<NodeBase*> current_level;
     for (auto* leaf : leaf_nodes) {
